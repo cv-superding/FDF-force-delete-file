@@ -1,0 +1,31 @@
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+
+# ---- PyInstaller 构建产物 ----
+build/
+dist/
+*.spec.bak
+
+# ---- 虚拟环境 ----
+venv/
+env/
+.venv/
+
+# ---- 项目本地数据（勿上传）----
+.workbuddy/
+dist/log/
+
+# ---- 编辑器 / 系统 ----
+.vscode/
+.idea/
+*.swp
+*.swo
+Thumbs.db
+Desktop.ini
+
+# ---- 临时诊断 ----
+dd_diag.txt
