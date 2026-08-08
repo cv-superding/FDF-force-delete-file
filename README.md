@@ -1,7 +1,7 @@
 # FDF — 强制删除文件工具 (Force Delete File)
 
 > Windows 下专治「文件被占用 / 拒绝访问 / 只读 / 被系统保护」等删不掉的场景。
-> 纯 Python + `ctypes` 实现的原生 Win32 GUI，**零第三方运行时依赖**，打包成单个 `.exe`。
+> 基于 **PySide6 (Qt 6)** 的现代 GUI，Windows 11 Fluent 风格（白底卡片、蓝色强调、圆角阴影）、高 DPI 适配、响应式布局。打包成单个 `.exe`。
 
 ---
 
@@ -21,13 +21,14 @@ FDF 通过一条**由轻到重的递进式删除链**逐级升级手段，尽量
 
 ## 二、功能特性
 
-- **纯 ctypes Win32 原生界面**：不使用 `tkinter`、不依赖任何 GUI 框架，也**不需要 C 编译器**。整个界面（窗口、按钮、列表、复选框、进度条、渐变背景、圆角）全部用 `ctypes` 调用 Win32 API 手绘。
+- **PySide6 (Qt 6) 现代界面**：基于 Qt 6 框架的 Fluent 风格 UI——白底卡片式布局、`#0078D4` 蓝色强调、圆角与阴影、高 DPI 自适应、响应式布局、原生拖放支持。
+- **全程 Qt 自绘对话框**：确认删除、警告提示、文件选择等弹窗均由 Qt 渲染并套用 Fluent 样式，**不调用原生 Windows 对话框**，在暗色 / 亮色系统主题下外观一致、清晰可读。
 - **拖放 / 粘贴路径**添加删除目标，支持文件与文件夹混合队列。
 - **递进式删除策略 L0–L6**，自动逐级升级（详见第三节）。
 - **双进程模型**：主界面以普通权限运行（与资源管理器同级，拖放正常），真正删除时由界面拉起**提权 worker 子进程**完成，避免 UIPI 拦截拖放。
 - **系统关键路径护栏**：内置受保护路径集合，防止手滑删除 `C:\Windows`、`C:\Users` 等导致系统崩溃。
 - **实时进度与日志**：worker 的日志 / 进度以 JSONL 流回写，主界面尾随读取并实时回显。
-- **莫奈（Monet）粉彩风格**的现代界面：渐变背景、圆角控件、悬停态按钮。
+- **悬停 / 按下态交互**：所有按钮带 Fluent 悬停与按下反馈；复选框为**自绘**（方框 + 对勾），不受系统主题影响，显示稳定。
 - **64 位**，目标系统 Windows 10 及以上。
 
 ---
@@ -118,7 +119,8 @@ C:\Users  C:\$Recycle.Bin  C:\Boot  C:\Recovery
 
 - Python 3.13（建议用虚拟环境）
 - PyInstaller 6.x
-- 仅标准库 + `ctypes`，**无第三方 Python 依赖**
+- **PySide6 6.11.x**（Qt 6 界面框架，含 PySide6_Addons）
+- 产物：`dist/FDF.exe` 为 64 位单文件，体积约 **45 MB**（已内嵌 Qt 运行时，用户无需单独安装）
 
 ### 步骤
 
@@ -127,8 +129,8 @@ C:\Users  C:\$Recycle.Bin  C:\Boot  C:\Recovery
 python -m venv fdf-build
 fdf-build\Scripts\activate
 
-# 2. 安装 PyInstaller
-pip install pyinstaller
+# 2. 安装依赖
+pip install pyinstaller PySide6
 
 # 3. 打包
 python build_bootstrap.py
@@ -158,7 +160,7 @@ FDF-force-delete-file/
 │   └── build_icon.py       # 图标生成脚本
 ├── src/fdf/
 │   ├── __init__.py         # 包说明
-│   ├── gui.py              # 纯 ctypes Win32 界面（窗口/控件/拖放/渲染）
+│   ├── gui.py              # PySide6 (Qt) 现代界面（布局/样式/拖放/信号桥）
 │   ├── engine.py           # 强制删除引擎（L0–L6 递进链 + 护栏）
 │   ├── winapi.py           # Win32 API 的 ctypes 封装与常量
 │   └── worker.py           # 提权工作进程（接收任务、执行删除、回写 JSONL）
@@ -188,9 +190,9 @@ python tests/test_gui_run.py
 
 ## 八、依赖
 
-**运行时：无第三方依赖。** 仅使用 Python 标准库与 `ctypes` 调用 Windows 系统 API。
+**运行时：** PySide6 (Qt) —— 由 PyInstaller 打包进单 exe，用户无需单独安装。
 
-**构建时：** 仅 `pyinstaller`。
+**构建时：** `pyinstaller` + `PySide6`。
 
 ---
 
