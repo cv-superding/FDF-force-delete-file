@@ -60,32 +60,40 @@ class _Emitter:
 
 def run_worker(job_path):
     """执行任务文件描述的工作，返回进程退出码。"""
-    with open(job_path, "r", encoding="utf-8") as f:
-        job = json.load(f)
+    # 任务文件读取/解析失败时无输出文件可写（out 路径就在 job 里），
+    # 只能写 stderr 并以非零退出码结束；主界面按"进程退出且无新数据"分支兜底。
+    try:
+        with open(job_path, "r", encoding="utf-8") as f:
+            job = json.load(f)
+    except Exception as e:  # noqa
+        sys.stderr.write(f"FDF worker: 任务文件读取失败: {e}\n")
+        return 2
 
-    out_path = job["out"]
-    cancel_path = job.get("cancel") or (job_path + ".cancel")
-    em = _Emitter(out_path)
-    cancel = threading.Event()
-
-    # 主界面通过创建 .cancel 文件来请求中止
-    def watch_cancel():
-        while not cancel.is_set():
-            if os.path.exists(cancel_path):
-                cancel.set()
-                return
-            time.sleep(0.3)
-
-    threading.Thread(target=watch_cancel, daemon=True).start()
-
+    em = None
     ok = True
     try:
+        out_path = job["out"]
+        cancel_path = job.get("cancel") or (job_path + ".cancel")
+        em = _Emitter(out_path)
+        cancel = threading.Event()
+
+        # 主界面通过创建 .cancel 文件来请求中止
+        def watch_cancel():
+            while not cancel.is_set():
+                if os.path.exists(cancel_path):
+                    cancel.set()
+                    return
+                time.sleep(0.3)
+
+        threading.Thread(target=watch_cancel, daemon=True).start()
+
         o = job.get("options") or {}
         opt = Options(
             unlock_handles=bool(o.get("unlock_handles", True)),
             kill_processes=bool(o.get("kill_processes", False)),
             take_ownership=bool(o.get("take_ownership", True)),
             schedule_reboot=bool(o.get("schedule_reboot", True)),
+            shred=bool(o.get("shred", False)),
         )
         d = ForceDeleter(
             opt,
@@ -105,8 +113,12 @@ def run_worker(job_path):
                         files=r.files, folders=r.folders, bytes=r.bytes)
     except Exception:  # noqa
         ok = False
-        em.emit(t="log", m="工作进程出错：\n" + traceback.format_exc(), l="err")
+        if em is not None:
+            em.emit(t="log", m="工作进程出错：\n" + traceback.format_exc(), l="err")
+        else:
+            sys.stderr.write(traceback.format_exc())
     finally:
-        em.emit(t="end", ok=ok)
-        em.close()
+        if em is not None:
+            em.emit(t="end", ok=ok)
+            em.close()
     return 0 if ok else 1

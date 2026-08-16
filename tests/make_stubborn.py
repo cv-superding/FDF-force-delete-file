@@ -1,6 +1,7 @@
 """生成各种"顽固文件"测试样本，并可选地以独占方式锁住其中一个文件。"""
 import ctypes
 import os
+import shutil
 import sys
 import time
 
@@ -70,8 +71,16 @@ def lock_forever(path):
         time.sleep(1)
 
 
+def cleanup():
+    """删除 %TEMP%\\fdf_testbed 整个目录，给测试残留提供清理入口。"""
+    shutil.rmtree(ROOT, ignore_errors=True)
+    print("测试目录已清理:", ROOT)
+
+
 if __name__ == "__main__":
     if len(sys.argv) > 2 and sys.argv[1] == "lock":
         lock_forever(sys.argv[2])
+    elif "--cleanup" in sys.argv[1:]:
+        cleanup()
     else:
         build()

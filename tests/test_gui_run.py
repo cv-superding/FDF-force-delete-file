@@ -1,39 +1,52 @@
 """GUI 运行时冒烟测试：真正创建窗口并运行消息循环数秒，验证子控件创建与 ctypes 调用正确。"""
-import sys
 import os
-import time
+import sys
+
+try:
+    from PySide6.QtCore import QTimer
+except ImportError:
+    print("SKIP: 本机未安装 PySide6，跳过 GUI 冒烟测试")
+    sys.exit(0)
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
-from fdf.gui import App, ID_DELETE
+
+import fdf.gui as gui
+from fdf.gui import App
+
+
+class _SmokeWindow(gui.MainWindow):
+    """冒烟窗口：首次显示时跑一次基础逻辑，并安排定时器自动退出消息循环。"""
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        if getattr(self, "_smoke_armed", False):
+            return
+        self._smoke_armed = True
+        # 此时已处于主线程、QApplication 与全部控件已创建
+        self.app._add_target(os.path.abspath(__file__))
+        self.app._log("冒烟测试：控件创建成功", "ok")
+        qapp = gui.QApplication.instance()
+        QTimer.singleShot(2500, qapp.quit)   # 常规退出
+        QTimer.singleShot(6000, qapp.quit)   # 超时兜底
 
 
 def main():
+    original_cls = gui.MainWindow
+    gui.MainWindow = _SmokeWindow
     app = App()
-    # 给 run() 一个自动退出的钩子：窗口创建后 2.5 秒自动结束
-    orig_create = app._create_controls
-
-    def patched_create():
-        orig_create()
-        # 模拟添加目标并刷新列表，验证运行时逻辑
-        app._add_target(os.path.abspath(__file__))
-        app._log("冒烟测试：控件创建成功", "ok")
-        # 2.5 秒后退出消息循环
-        import threading
-        def quit_later():
-            time.sleep(2.5)
-            import ctypes
-            user32 = ctypes.WinDLL("user32")
-            user32.PostQuitMessage(0)
-        threading.Thread(target=quit_later, daemon=True).start()
-
-    app._create_controls = patched_create
     try:
-        app.run()
+        try:
+            app.run()   # 正常以 sys.exit(exec()) 结束
+        except SystemExit:
+            pass
         print("SMOKE_OK: 窗口创建并运行消息循环成功，已自动退出")
-    except Exception as e:  # noqa
+    except Exception:  # noqa
         import traceback
-        print("SMOKE_FAIL:", repr(e))
+        print("SMOKE_FAIL:")
         traceback.print_exc()
+        raise SystemExit(1)
+    finally:
+        gui.MainWindow = original_cls
 
 
 if __name__ == "__main__":

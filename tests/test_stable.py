@@ -49,6 +49,7 @@ def main(rounds=6):
         opt = Options(unlock_handles=True, kill_processes=False,
                       take_ownership=True, schedule_reboot=False)
         d = ForceDeleter(opt, log=log)
+        results = []   # 先初始化：delete 抛异常时异常直接向上抛，不再被 NameError 掩盖
         try:
             results = d.delete([ROOT])
         finally:
@@ -59,6 +60,8 @@ def main(rounds=6):
                 except Exception:
                     locker.kill()
 
+        if not results:
+            raise RuntimeError("本轮删除没有返回任何结果")
         status = results[0].status
         elapsed = time.time() - t0
         ok = not os.path.exists(ROOT)

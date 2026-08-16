@@ -21,14 +21,30 @@ from dataclasses import dataclass, field
 
 from . import winapi as w
 
-sys.setrecursionlimit(8000)
 
-# 绝对不允许作为删除目标的路径（防手滑毁系统）
-_PROTECTED = {
-    r"c:\\", r"c:\windows", r"c:\windows\system32", r"c:\windows\syswow64",
-    r"c:\program files", r"c:\program files (x86)", r"c:\programdata",
-    r"c:\users", r"c:\$recycle.bin", r"c:\boot", r"c:\recovery",
-}
+def _build_protected():
+    """
+    动态构造受保护路径集合，不硬编码 C: 盘（系统可能装在其他盘符）。
+
+    _PROTECTED_EXACT : 整体删除被禁止的路径（用户仍可删其子目录，如卸载残留）
+    _PROTECTED_TREE  : 整棵子树都受保护（Windows 目录内任何东西都不允许动）
+    """
+    sysdrive = (os.environ.get("SystemDrive") or "C:").rstrip(":\\").lower()  # "c"
+    exact = {f"{sysdrive}:\\users", f"{sysdrive}:\\programdata",
+             f"{sysdrive}:\\program files", f"{sysdrive}:\\program files (x86)",
+             f"{sysdrive}:\\perflogs"}
+    tree = {f"{sysdrive}:\\boot", f"{sysdrive}:\\efi", f"{sysdrive}:\\recovery",
+            f"{sysdrive}:\\system volume information",
+            f"{sysdrive}:\\config.msi"}
+    for c in "abcdefghijklmnopqrstuvwxyz":
+        exact.add(f"{c}:\\")                    # 所有卷根
+        exact.add(f"{c}:\\$recycle.bin")        # 所有盘的回收站
+        tree.add(f"{c}:\\windows")              # 任何盘符下的 Windows 目录（覆盖第二系统盘）
+        tree.add(f"{c}:\\system volume information")
+    return exact, tree
+
+
+_PROTECTED_EXACT, _PROTECTED_TREE = _build_protected()
 
 STATUS_DELETED = "deleted"
 STATUS_REBOOT = "reboot"
@@ -58,23 +74,39 @@ class ItemResult:
 
 
 def is_protected(path: str) -> bool:
-    """判断是否为受保护的系统关键路径。"""
-    p = os.path.abspath(path).rstrip("\\").lower()
-    if len(p) <= 2 and p.endswith(":"):
-        return True
-    if p + "\\" in _PROTECTED or p in _PROTECTED:
-        return True
-    for prot in (r"c:\windows\system32", r"c:\windows\syswow64"):
-        if p == prot:
+    """
+    判断是否为受保护的系统关键路径。
+
+    防绕过：先用 w.norm_path 做权威规范化（剥 \\\\?\\ 前缀、展开 8.3 短名、
+    去尾分隔符），再用 w.real_path 跟随符号链接/junction 解析出物理路径一并校验，
+    保证"护栏比较的路径"与"实际删除的路径"是同一个对象。
+    """
+    candidates = [w.norm_path(path).lower()]
+    rp = w.real_path(path)
+    if rp:
+        candidates.append(w.norm_path(rp).lower())
+
+    for p in candidates:
+        if len(p) <= 3 and p.rstrip("\\").endswith(":"):
+            return True  # 卷根（X: 或 X:\\）
+        if p.startswith("\\\\") and p.count("\\") <= 3:
+            return True  # UNC 共享根 \\\\server\\share
+        if p in _PROTECTED_EXACT:
             return True
+        for q in _PROTECTED_TREE:
+            if p == q or p.startswith(q + "\\"):
+                return True
+
     # 用户主目录本身
     up = os.environ.get("USERPROFILE", "")
-    if up and p == up.rstrip("\\").lower():
-        return True
+    if up:
+        upn = w.norm_path(up).lower()
+        if any(p == upn for p in candidates):
+            return True
     # 正在运行的本程序所在目录
     try:
         self_dir = os.path.dirname(os.path.abspath(sys.executable)).lower()
-        if p == self_dir:
+        if any(p == w.norm_path(self_dir).lower() for p in candidates):
             return True
     except Exception:
         pass
@@ -110,6 +142,9 @@ class ForceDeleter:
         if not w.is_admin():
             self._log("当前非管理员身份运行，部分受保护文件可能无法删除", "warn")
 
+        # 入口统一规范化（剥前缀/展开短名/去尾分隔符），护栏与删除操作共用同一写法
+        paths = [w.norm_path(p) for p in paths]
+
         results: dict[str, ItemResult] = {}
         pending: list[str] = []
 
@@ -136,12 +171,17 @@ class ForceDeleter:
         if pending and self.opt.take_ownership and not self.cancel.is_set():
             self._log("步骤 2/5 · 接管所有权并重写权限", "step")
             leaves = self._collect_leaves(pending, results)
+            done = 0
             for i, leaf in enumerate(leaves):
                 if self.cancel.is_set():
                     break
                 self._progress(i, len(leaves), "接管权限")
-                w.take_ownership(leaf, w.is_directory(leaf))
-            self._log(f"已对 {len(leaves)} 个对象重设所有权与 DACL", "dim")
+                if w.take_ownership(leaf, w.is_directory(leaf)):
+                    done += 1
+            if done == len(leaves):
+                self._log(f"已对 {done} 个对象重设所有权与 DACL", "dim")
+            else:
+                self._log(f"所有权/DACL 重设成功 {done}/{len(leaves)}，部分对象保留原权限", "warn")
             pending = self._sweep(pending, results)
 
         # ---------- 第 3 轮：强制关闭占用句柄 ----------
@@ -176,13 +216,25 @@ class ForceDeleter:
                 r = results[p]
                 leaves = r.failed_leaves or [p]
                 ok_any = False
+                skipped_dirs = 0
                 for leaf in leaves:
+                    # PFRO 不递归：非空目录登记了也删不掉，直接跳过并如实计数
+                    if w.is_directory(leaf) and not w.is_reparse_point(leaf):
+                        try:
+                            next(iter(w.enum_dir(leaf)))
+                            skipped_dirs += 1
+                            continue
+                        except StopIteration:
+                            pass
+                        except Exception:
+                            pass
                     if w.schedule_delete_on_reboot(leaf):
                         ok_any = True
                 if ok_any:
                     r.status = STATUS_REBOOT
-                    r.detail = "已登记，重启电脑后自动删除"
-                    self._log(f"[待重启] {p}", "warn")
+                    extra = f"（{skipped_dirs} 个非空目录无法登记）" if skipped_dirs else ""
+                    r.detail = "已登记，重启电脑后自动删除" + extra
+                    self._log(f"[待重启] {p}{extra}", "warn")
                 else:
                     r.detail = self._describe(p, r)
             pending = [p for p in pending if results[p].status != STATUS_REBOOT]
@@ -217,7 +269,11 @@ class ForceDeleter:
             if self.cancel.is_set():
                 break
             self._progress(i, len(targets), "查询占用")
-            for pid in w.get_pids_using_file(t):
+            pids, qerr = w.get_pids_using_file(t)
+            if qerr not in (0, w.ERROR_FILE_NOT_FOUND, w.ERROR_PATH_NOT_FOUND):
+                # 独占打开/权限不足等：检测不可用，与"无人占用"区分开
+                self._log(f"占用查询不可用（{w.error_text(qerr)}）：{t}", "dim")
+            for pid in pids:
                 if pid in (0, 4):
                     continue
                 item = found.setdefault(pid, {"pid": pid, "name": "", "image": "",
@@ -275,39 +331,55 @@ class ForceDeleter:
         return still
 
     def _delete_tree(self, path: str, failures: list[str]) -> bool:
+        """
+        显式栈的迭代后序遍历删除。
+        不用递归：长路径允许上万层嵌套，Python 递归到几千层就会打穿
+        线程的 1MB C 栈直接 access violation（不是 RecursionError），
+        worker 崩掉后主界面收不到 end 事件。
+        """
         if self.cancel.is_set():
             return False
-        attrs = w.get_attributes(path)
-        if attrs == w.INVALID_FILE_ATTRIBUTES:
-            return True  # 已经不存在
-        is_dir = bool(attrs & w.FILE_ATTRIBUTE_DIRECTORY)
-        is_rp = bool(attrs & w.FILE_ATTRIBUTE_REPARSE_POINT)
-
-        size = 0
-        if is_dir and not is_rp:
-            for name, child_dir, child_rp, child_size in w.enum_dir(path):
-                self._delete_tree(os.path.join(path, name), failures)
-                if self.cancel.is_set():
-                    return False
-        elif not is_dir:
-            size = self._file_size(path)
-
-        if self._delete_leaf(path, is_dir, attrs):
-            if is_dir:
-                self._stats["folders"] += 1
+        ENTERED = 1  # 目录已入栈、子项已排入，等子项处理完后自身出栈删除
+        stack: list[tuple[str, int]] = [(path, 0)]
+        ok = True
+        while stack:
+            cur, state = stack.pop()
+            if self.cancel.is_set():
+                return False
+            attrs = w.get_attributes(cur)
+            if attrs == w.INVALID_FILE_ATTRIBUTES:
+                continue  # 已不存在
+            is_dir = bool(attrs & w.FILE_ATTRIBUTE_DIRECTORY)
+            is_rp = bool(attrs & w.FILE_ATTRIBUTE_REPARSE_POINT)
+            if state != ENTERED and is_dir and not is_rp:
+                stack.append((cur, ENTERED))
+                for name, _d, _rp, _sz in w.enum_dir(cur):
+                    stack.append((os.path.join(cur, name), 0))
+                continue
+            size = 0 if is_dir else self._file_size(cur)
+            if self._delete_leaf(cur, is_dir, attrs):
+                if is_dir:
+                    self._stats["folders"] += 1
+                else:
+                    self._stats["files"] += 1
+                    self._stats["bytes"] += size
             else:
-                self._stats["files"] += 1
-                self._stats["bytes"] += size
-            return True
-        failures.append(path)
-        return False
+                failures.append(cur)
+                ok = False
+        return ok
 
     def _delete_leaf(self, path: str, is_dir: bool, attrs: int) -> bool:
         if attrs & (w.FILE_ATTRIBUTE_READONLY | w.FILE_ATTRIBUTE_HIDDEN | w.FILE_ATTRIBUTE_SYSTEM):
             w.clear_attributes(path)
 
         if self.opt.shred and not is_dir:
-            w.overwrite_file(path)
+            # 覆写失败（权限/共享冲突/符号链接）时如实告知，内容可能仍可恢复
+            try:
+                shredded = w.overwrite_file(path)
+            except Exception:  # noqa
+                shredded = False
+            if not shredded:
+                self._log(f"警告：覆写失败，内容可能仍可恢复 — {path}", "warn")
 
         err = 0
         for i in range(3):
@@ -320,8 +392,9 @@ class ForceDeleter:
             err = e2 or e1
             if err in (w.ERROR_FILE_NOT_FOUND, w.ERROR_PATH_NOT_FOUND):
                 return True
-            if err not in (w.ERROR_SHARING_VIOLATION, w.ERROR_LOCK_VIOLATION,
-                           w.ERROR_ACCESS_DENIED, w.ERROR_DIR_NOT_EMPTY):
+            # 只对"瞬时占用"类错误重试；ACCESS_DENIED 重试无意义（本轮内
+            # 不会有状态变化），DIR_NOT_EMPTY 意味着有子项本轮没删掉，直接升级
+            if err not in (w.ERROR_SHARING_VIOLATION, w.ERROR_LOCK_VIOLATION):
                 break
             time.sleep(0.01 * (i + 1))
 
@@ -342,7 +415,8 @@ class ForceDeleter:
     def _kill_lockers(self, leaves: list[str]) -> list[str]:
         pids: dict[int, str] = {}
         for leaf in leaves[:400]:
-            for pid in w.get_pids_using_file(leaf):
+            pids_using, _err = w.get_pids_using_file(leaf)
+            for pid in pids_using:
                 if pid not in (0, 4):
                     pids.setdefault(pid, "")
         for chunk in (leaves[i:i + 64] for i in range(0, min(len(leaves), 400), 64)):
@@ -357,9 +431,8 @@ class ForceDeleter:
                 continue
             image = w.get_process_image(pid)
             base = os.path.basename(image).lower() if image else ""
-            # 关键系统进程一律不动
-            if base in ("csrss.exe", "wininit.exe", "winlogon.exe", "services.exe",
-                        "lsass.exe", "smss.exe", "system", "svchost.exe"):
+            # 关键系统进程一律不动（与 winapi.CRITICAL_PROCESSES 同一份名单）
+            if base in w.CRITICAL_PROCESSES:
                 self._log(f"跳过系统关键进程 {base} (PID {pid})", "warn")
                 continue
             if w.kill_process(pid):

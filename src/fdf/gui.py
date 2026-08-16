@@ -52,13 +52,16 @@ F = {
 }
 
 # 控件 ID（沿用原命令分发逻辑）
-ID_ADD_FILE, ID_ADD_DIR, ID_REMOVE, ID_PASTE, ID_CLEAR, ID_SCAN, ID_DELETE = range(1001, 1008)
+ID_ADD_FILE, ID_ADD_DIR, ID_REMOVE, ID_PASTE, ID_CLEAR, ID_SCAN, ID_DELETE, \
+    ID_CANCEL = range(1001, 1009)
 
 # ---------------------------------------------------------------------------
 # 提权相关 ctypes（仅用于 UAC 拉起 worker 子进程，其余 UI 全由 Qt 接管）
+# 用 WinDLL(use_last_error=True) 而非 windll：ctypes.get_last_error() 才能取到
+# ShellExecuteExW 失败时的真实错误码（如 UAC 取消 ERROR_CANCELLED=1223）。
 # ---------------------------------------------------------------------------
-_shell32 = ctypes.windll.shell32
-_kernel32 = ctypes.windll.kernel32
+_shell32 = ctypes.WinDLL("shell32", use_last_error=True)
+_kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
 
 
 class SHELLEXECUTEINFOW(ctypes.Structure):
@@ -90,6 +93,14 @@ ERROR_CANCELLED = 1223
 _SEI_FUNC = _shell32.ShellExecuteExW
 _SEI_FUNC.argtypes = [ctypes.POINTER(SHELLEXECUTEINFOW)]
 _SEI_FUNC.restype = wintypes.BOOL
+
+# 句柄 / 等待相关 API：显式声明 argtypes，避免 64 位句柄按默认 c_int 截断
+_kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+_kernel32.WaitForSingleObject.restype = wintypes.DWORD
+_kernel32.TerminateProcess.argtypes = [wintypes.HANDLE, wintypes.UINT]
+_kernel32.TerminateProcess.restype = wintypes.BOOL
+_kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+_kernel32.CloseHandle.restype = wintypes.BOOL
 
 
 def _runas(exe, params, hwnd=0):
@@ -129,6 +140,36 @@ def _is_elevated():
         return False
 
 
+def _split_clipboard_paths(text):
+    """把剪贴板文本拆成路径列表：按行拆分；单行内支持空格分隔与引号包裹。
+
+    Windows 路径含反斜杠，不能用 shlex 的 posix 转义语义，这里用简单
+    状态机：仅在引号外把空白当分隔符，成对引号包裹含空格的路径。
+    """
+    paths = []
+    for line in text.replace("\r", "\n").split("\n"):
+        line = line.strip()
+        if not line:
+            continue
+        if '"' not in line and not any(c.isspace() for c in line):
+            paths.append(line)
+            continue
+        cur = []
+        quoted = False
+        for ch in line:
+            if ch == '"':
+                quoted = not quoted
+            elif ch.isspace() and not quoted:
+                if cur:
+                    paths.append("".join(cur))
+                    cur = []
+            else:
+                cur.append(ch)
+        if cur:
+            paths.append("".join(cur))
+    return paths
+
+
 # ---------------------------------------------------------------------------
 # Qt 导入（仅 GUI 模式会执行到本模块；worker 模式不 import）
 # ---------------------------------------------------------------------------
@@ -163,14 +204,18 @@ class App:
         self._bus = _Bus()
         self.win = None
         self._qapp = None
+        self._worker_thread = None   # 当前工作线程（退出窗口时带超时 join）
+        self._cancel_path = None     # 提权任务的 cancel 文件（取消/退出时写入）
+        self._job_files = ()         # 提权任务的临时文件（退出时兜底清理）
 
     # ===================================================================
     # 入口
     # ===================================================================
     def run(self):
-        self._qapp = QApplication(sys.argv)
-        self._qapp.setHighDpiScaleFactorRoundingPolicy(
+        # 高 DPI 取整策略必须在 QApplication 构造之前设置（构造后再调用是 no-op）
+        QApplication.setHighDpiScaleFactorRoundingPolicy(
             Qt.HighDpiScaleFactorRoundingPolicy.PassThrough)
+        self._qapp = QApplication(sys.argv)
         self._qapp.setStyle("Fusion")
         self.win = MainWindow(self)
         # 全局样式表：所有 Qt 对话框（含 QFileDialog）自动继承 Fluent 风格，
@@ -210,15 +255,17 @@ class App:
     # 业务：目标管理
     # ===================================================================
     def _add_target(self, path):
+        """把路径加入目标列表，成功入列返回 True（重复/不存在返回 False）。"""
         ap = os.path.abspath(path)
         if any(ap.lower() == t.lower() for t in self.targets):
-            return
+            return False
         if not w.path_exists(ap):
             self._log(f"路径不存在，已忽略：{ap}", "err")
-            return
+            return False
         self.targets.append(ap)
         self._refresh_list()
         self._log(f"已添加：{ap}", "dim")
+        return True
 
     def _remove_selected(self, index):
         if index < 0 or index >= len(self.targets):
@@ -236,13 +283,11 @@ class App:
         if self.busy:
             self._log("正在处理任务，已忽略本次拖入。", "warn")
             return
-        n = 0
-        for p in paths:
-            if p:
-                self._add_target(p)
-                n += 1
+        n = sum(1 for p in paths if p and self._add_target(p))
         if n:
             self._log(f"已从拖放添加 {n} 个项目。", "ok")
+        else:
+            self._log("没有新项目被添加（重复或路径不存在）。", "warn")
 
     def _paste_from_clipboard(self):
         if self.busy:
@@ -255,19 +300,18 @@ class App:
                     if u.isLocalFile():
                         paths.append(u.toLocalFile())
             elif mime.hasText():
-                for line in mime.text().replace("\r", "\n").split("\n"):
-                    line = line.strip().strip('"')
-                    if line:
-                        paths.append(line)
+                paths = _split_clipboard_paths(mime.text())
         except Exception as e:
             self._log(f"读取剪贴板失败：{e}", "err")
             return
         if not paths:
             self._log("剪贴板中没有文件或路径（可在资源管理器选中后 Ctrl+C）。", "warn")
             return
-        for p in paths:
-            self._add_target(p)
-        self._log(f"已从剪贴板添加 {len(paths)} 个项目。", "ok")
+        n = sum(1 for p in paths if self._add_target(p))
+        if n:
+            self._log(f"已从剪贴板添加 {n} 个项目。", "ok")
+        else:
+            self._log("剪贴板中的路径均未入列（重复或不存在）。", "warn")
 
     # ===================================================================
     # 业务：选择对话框
@@ -292,12 +336,18 @@ class App:
         return _show_confirm(
             self.win,
             "确认删除",
-            f"确定要强制删除选中的 {n} 个项目吗？\n此操作不可撤销，请确认目标无误。")
+            f"即将强制删除列表中的全部 {n} 个项目（无论是否选中）。\n此操作不可撤销，请确认目标无误。")
 
     # ===================================================================
     # 命令分发
     # ===================================================================
     def _on_command(self, cid):
+        if cid == ID_CANCEL:
+            # 取消仅在任务进行中有效：请求中止后等现有流程自然收尾
+            if self.busy:
+                self.request_cancel()
+                self._log("已请求取消，等待当前操作中止…", "warn")
+            return
         if self.busy:
             return
         if cid == ID_ADD_FILE:
@@ -314,14 +364,14 @@ class App:
             if not self.targets:
                 self._log("请先添加要扫描的目标。", "warn")
                 return
-            threading.Thread(target=self._run_worker, args=("scan",), daemon=True).start()
+            self._start_worker("scan")
         elif cid == ID_DELETE:
             if not self.targets:
                 self._log("请先添加要删除的目标。", "warn")
                 return
             if not self._confirm_delete():
                 return
-            threading.Thread(target=self._run_worker, args=("delete",), daemon=True).start()
+            self._start_worker("delete")
 
     # ===================================================================
     # 业务：删除 / 扫描（双进程模型）
@@ -332,21 +382,46 @@ class App:
             kill_processes=self.win.chk_kill.isChecked(),
             take_ownership=self.win.chk_own.isChecked(),
             schedule_reboot=self.win.chk_reboot.isChecked(),
+            shred=self.win.chk_shred.isChecked(),
         )
 
-    def _run_worker(self, kind):
+    def _start_worker(self, kind):
+        """在主线程内取好 Qt 状态快照并启动工作线程。
+
+        · options 快照与窗口句柄都在主线程读取，工作线程不再触碰任何
+          Qt 对象（QCheckBox.isChecked / winId 均非线程安全）；
+        · busy 在 start() 之前置位，避免快速双击并发拉起两个提权 worker。
+        """
         if self.busy:
             return
         self.busy = True
+        options = self._options()
+        hwnd = int(self.win.winId()) if self.win else 0
+        self._worker_thread = threading.Thread(
+            target=self._run_worker, args=(kind, options, hwnd), daemon=True)
+        self._worker_thread.start()
+
+    def request_cancel(self):
+        """请求中止当前任务：置取消事件，并向提权 worker 写 cancel 文件。"""
+        self.cancel.set()
+        cp = self._cancel_path
+        if cp and not os.path.exists(cp):
+            try:
+                open(cp, "w").close()
+            except Exception as e:
+                self._log(f"写入取消标记失败：{e}", "warn")
+
+    def _run_worker(self, kind, options, hwnd):
         self.cancel.clear()
         self._bus.enabled.emit(False)
         self._bus.busy.emit(True)
+        self._bus.progress.emit(0)   # 重置进度条，避免显示上一轮的 100%
         self._update_status("正在处理…")
         try:
             if _is_elevated():
-                self._run_inprocess(kind)
+                self._run_inprocess(kind, options)
             else:
-                self._run_elevated(kind)
+                self._run_elevated(kind, options, hwnd)
         except Exception:
             import traceback
             self._log("执行出错：" + traceback.format_exc(), "err")
@@ -356,9 +431,9 @@ class App:
             self._bus.busy.emit(False)
             self._update_status("操作完成。")
 
-    def _run_inprocess(self, kind):
+    def _run_inprocess(self, kind, options):
         d = ForceDeleter(
-            self._options(),
+            options,
             log=lambda m, l="info": self._log(m, l),
             progress=lambda done, total, s="": self._progress(done, total),
             cancel=self.cancel,
@@ -376,7 +451,7 @@ class App:
             self._results = {r.path: r for r in results}
             self._bus.results.emit(self._results)
 
-    def _run_elevated(self, kind):
+    def _run_elevated(self, kind, options, hwnd):
         """普通权限：拉起提权的 --worker 子进程执行，实时回显其输出。"""
         import tempfile
         tag = uuid.uuid4().hex[:12]
@@ -384,17 +459,20 @@ class App:
         job_path = os.path.join(tmp, f"fdf_job_{tag}.json")
         out_path = os.path.join(tmp, f"fdf_out_{tag}.jsonl")
         cancel_path = os.path.join(tmp, f"fdf_cancel_{tag}.flag")
-        o = self._options()
+        # 记录到实例上，供「取消」按钮与窗口关闭时的收尾逻辑使用
+        self._cancel_path = cancel_path
+        self._job_files = (job_path, out_path, cancel_path)
         job = {
             "kind": kind,
             "targets": list(self.targets),
             "out": out_path,
             "cancel": cancel_path,
             "options": {
-                "unlock_handles": o.unlock_handles,
-                "kill_processes": o.kill_processes,
-                "take_ownership": o.take_ownership,
-                "schedule_reboot": o.schedule_reboot,
+                "unlock_handles": options.unlock_handles,
+                "kill_processes": options.kill_processes,
+                "take_ownership": options.take_ownership,
+                "schedule_reboot": options.schedule_reboot,
+                "shred": options.shred,
             },
         }
         with open(job_path, "w", encoding="utf-8") as f:
@@ -411,25 +489,34 @@ class App:
 
         self._log("正在请求管理员权限…（请在 UAC 弹窗中点「是」）", "step")
 
-        hwnd = int(self.win.winId()) if self.win else 0
         hproc, err = _runas(exe, args, hwnd=hwnd)
         if hproc is None:
             if err == ERROR_CANCELLED:
                 self._log("已取消提权，操作未执行。", "warn")
             else:
                 self._log(f"无法启动提权进程（错误码 {err}）。", "err")
-            self._cleanup_job(job_path, out_path, cancel_path)
+            self._finish_job(job_path, out_path, cancel_path, hproc=None)
             return
 
         self._log("已获得管理员权限，开始执行。", "ok")
         try:
             self._pump_worker(out_path, cancel_path, hproc)
         finally:
-            try:
+            self._finish_job(job_path, out_path, cancel_path, hproc=hproc)
+
+    def _finish_job(self, job_path, out_path, cancel_path, hproc=None):
+        """收尾：等 worker 进程退出、关句柄、清理临时文件并复位任务状态。"""
+        try:
+            if hproc is not None:
+                # 先等进程真正退出再删临时文件，避免其仍占用 job/out 文件
+                if _kernel32.WaitForSingleObject(hproc, 5000) != 0:
+                    self._log("等待工作进程退出超时，仍尝试清理临时文件。", "warn")
                 _kernel32.CloseHandle(hproc)
-            except Exception:
-                pass
-            self._cleanup_job(job_path, out_path, cancel_path)
+        except Exception:
+            pass
+        self._cleanup_job(job_path, out_path, cancel_path)
+        self._cancel_path = None
+        self._job_files = ()
 
     def _pump_worker(self, out_path, cancel_path, hproc):
         """轮询工作进程的 JSONL 输出并转成界面事件。"""
@@ -440,14 +527,48 @@ class App:
         ended = False
         _start = _time.time()
         _TIMEOUT = 600.0   # 单次操作最长等待 10 分钟
+
+        def handle_line(line):
+            nonlocal ended
+            line = line.strip()
+            if not line:
+                return
+            try:
+                ev = json.loads(line)
+            except Exception:
+                return
+            t = ev.get("t")
+            if t == "log":
+                self._log(ev.get("m", ""), ev.get("l", "info"))
+            elif t == "prog":
+                self._progress(ev.get("d", 0), ev.get("n", 0))
+            elif t == "proc":
+                procs.append(ev)
+            elif t == "res":
+                r = ItemResult(
+                    path=ev.get("path", ""), status=ev.get("status", ""),
+                    detail=ev.get("detail", ""), files=ev.get("files", 0),
+                    folders=ev.get("folders", 0), bytes=ev.get("bytes", 0))
+                results[r.path] = r
+            elif t == "end":
+                ended = True
+
         while True:
-            # ---- 超时保护 ----
+            # ---- 超时保护：优先写 cancel 文件请求 worker 自行退出，
+            #      TerminateProcess 仅作最后手段 ----
             if _time.time() - _start > _TIMEOUT:
-                self._log(f"操作超时（{_TIMEOUT:.0f}秒），工作进程可能已卡死。", "err")
+                self._log(f"操作超时（{_TIMEOUT:.0f}秒），正在请求工作进程中止…", "err")
                 try:
-                    _kernel32.TerminateProcess(hproc, 1)
+                    if not os.path.exists(cancel_path):
+                        open(cancel_path, "w").close()
                 except Exception:
                     pass
+                if _kernel32.WaitForSingleObject(hproc, 5000) != 0:
+                    self._log("工作进程未响应取消请求，强制结束进程。", "err")
+                    if not _kernel32.TerminateProcess(hproc, 1):
+                        self._log(
+                            f"强制结束工作进程失败（错误码 {ctypes.get_last_error()}）。",
+                            "err")
                 break
 
             if self.cancel.is_set() and not os.path.exists(cancel_path):
@@ -455,46 +576,34 @@ class App:
                     open(cancel_path, "w").close()
                 except Exception:
                     pass
+            # ---- 尾随读取：二进制模式（seek/tell 为精确字节偏移），
+            #      只处理以换行结尾的完整行，pos 仅推进到最后一个换行符处，
+            #      写入中途的残行留待下轮重读，避免半行被当成整行吞掉 ----
             try:
-                with open(out_path, "r", encoding="utf-8") as f:
+                with open(out_path, "rb") as f:
                     f.seek(pos)
                     chunk = f.read()
-                    pos = f.tell()
             except Exception:
-                chunk = ""
-            for line in chunk.splitlines():
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    ev = json.loads(line)
-                except Exception:
-                    continue
-                t = ev.get("t")
-                if t == "log":
-                    self._log(ev.get("m", ""), ev.get("l", "info"))
-                elif t == "prog":
-                    self._progress(ev.get("d", 0), ev.get("n", 0))
-                elif t == "proc":
-                    procs.append(ev)
-                elif t == "res":
-                    r = ItemResult(
-                        path=ev.get("path", ""), status=ev.get("status", ""),
-                        detail=ev.get("detail", ""), files=ev.get("files", 0),
-                        folders=ev.get("folders", 0), bytes=ev.get("bytes", 0))
-                    results[r.path] = r
-                elif t == "end":
-                    ended = True
+                chunk = b""
+            last_nl = chunk.rfind(b"\n")
+            if last_nl >= 0:
+                for raw in chunk[:last_nl + 1].split(b"\n"):
+                    handle_line(raw.decode("utf-8", "replace"))
+                pos += last_nl + 1
             if ended:
                 break
-            if _kernel32.WaitForSingleObject(hproc, 0) == 0 and not chunk:
+            if _kernel32.WaitForSingleObject(hproc, 0) == 0:
+                # 进程已退出：稍候最后的输出落盘，终读一次后收尾
                 time.sleep(0.2)
                 try:
-                    if os.path.getsize(out_path) <= pos:
-                        break
+                    with open(out_path, "rb") as f:
+                        f.seek(pos)
+                        tail = f.read()
+                    for raw in tail.split(b"\n"):
+                        handle_line(raw.decode("utf-8", "replace"))
                 except Exception:
-                    break
-                continue
+                    pass
+                break
             time.sleep(0.15)
 
         if procs:
@@ -507,14 +616,20 @@ class App:
             self._results = results
             self._bus.results.emit(results)
 
-    @staticmethod
-    def _cleanup_job(*paths):
+    def _cleanup_job(self, *paths):
+        """删除任务临时文件；短超时重试，失败时记录日志而不是静默吞掉。"""
         for p in paths:
-            try:
-                if p and os.path.exists(p):
-                    os.remove(p)
-            except Exception:
-                pass
+            if not p:
+                continue
+            for attempt in range(5):
+                try:
+                    if os.path.exists(p):
+                        os.remove(p)
+                    break
+                except Exception as e:
+                    if attempt == 4:
+                        self._log(f"清理临时文件失败：{p}（{e}）", "warn")
+                    time.sleep(0.1)
 
 
 # ===========================================================================
@@ -786,6 +901,7 @@ class MainWindow(QWidget):
         # 列表下方操作按钮行
         btn_row = QHBoxLayout()
         btn_row.setSpacing(8)
+        self._target_btns = []   # 目标管理按钮，busy 期间一并禁用
         for text, cid in [
             ("\uD83D\uDCC1  添加文件", ID_ADD_FILE),
             ("\uD83D\uDCC2  添加文件夹", ID_ADD_DIR),
@@ -798,6 +914,7 @@ class MainWindow(QWidget):
             b.setCursor(Qt.CursorShape.PointingHandCursor)
             b.clicked.connect(lambda checked, c=cid: self.app._on_command(c))
             btn_row.addWidget(b)
+            self._target_btns.append(b)
         btn_row.addStretch(1)
         tl.addLayout(btn_row)
 
@@ -817,6 +934,7 @@ class MainWindow(QWidget):
         self.chk_kill = _CheckButton("\u2699\uFE0F  结束占用进程")
         self.chk_own = _CheckButton("\uD83D\uDC51  接管所有权与权限")
         self.chk_reboot = _CheckButton("\uD83D\uDD04  重启时删除（兜底）")
+        self.chk_shred = _CheckButton("\uD83D\uDD25  删除前粉碎覆写")
         self.chk_unlock.setChecked(True)
         self.chk_own.setChecked(True)
         self.chk_reboot.setChecked(True)
@@ -825,6 +943,7 @@ class MainWindow(QWidget):
         og.addWidget(self.chk_kill, 0, 1)
         og.addWidget(self.chk_own, 1, 0)
         og.addWidget(self.chk_reboot, 1, 1)
+        og.addWidget(self.chk_shred, 2, 0)
         ol.addLayout(og)
 
         cl.addWidget(opt_card)
@@ -849,8 +968,16 @@ class MainWindow(QWidget):
         self.btn_delete.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_delete.clicked.connect(lambda: self.app._on_command(ID_DELETE))
 
+        # 取消按钮：仅任务进行中（busy）可用，点击后请求 worker 中止
+        self.btn_cancel = QPushButton("\u23F9  取消")
+        self.btn_cancel.setObjectName("btnSecondary")
+        self.btn_cancel.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_cancel.setEnabled(False)
+        self.btn_cancel.clicked.connect(lambda: self.app._on_command(ID_CANCEL))
+
         act_btn_row.addWidget(self.btn_scan)
         act_btn_row.addWidget(self.btn_delete)
+        act_btn_row.addWidget(self.btn_cancel)
         act_btn_row.addStretch(1)
         al.addLayout(act_btn_row)
 
@@ -893,9 +1020,31 @@ class MainWindow(QWidget):
         b.results.connect(self.refresh_list)
         b.busy.connect(self.set_busy)
 
+    # -------------------------------------------------------------- 关闭
+    def closeEvent(self, event):
+        app = self.app
+        if app.busy:
+            if not _show_confirm(
+                    self, "确认退出",
+                    "任务正在执行，退出将请求中止当前操作。\n确定要退出吗？"):
+                event.ignore()
+                return
+            app.request_cancel()
+        t = app._worker_thread
+        if t is not None and t.is_alive():
+            # 带超时 join，不无限等待
+            t.join(timeout=5.0)
+            if t.is_alive():
+                # 线程仍未结束：屏蔽信号桥，避免其在窗口销毁后继续触碰 Qt 对象
+                app._bus.blockSignals(True)
+        # 兜底清理尚未删除的任务临时文件（正常路径由线程自行清理）
+        app._cleanup_job(*(app._job_files or ()))
+        event.accept()
+
     # -------------------------------------------------------------- 拖放
     def dragEnterEvent(self, e: QDragEnterEvent):
-        if e.mimeData().hasUrls():
+        # 仅在接受到本地文件 URL 时 accept；http 等远程链接不给"可放下"暗示
+        if any(u.isLocalFile() for u in e.mimeData().urls()):
             e.acceptProposedAction()
             self.list.setProperty("dragOver", True)
             self.list.style().unpolish(self.list)
@@ -937,23 +1086,28 @@ class MainWindow(QWidget):
 
     def set_progress(self, pct):
         self.progress.setValue(pct)
-        if pct > 0:
-            self.progress.setFormat(f"  {pct}%")
+        # pct==0（任务启动重置）时清掉 format，避免新任务短暂显示上一轮的 100%
+        self.progress.setFormat(f"  {pct}%" if pct > 0 else "")
 
     def set_status(self, text):
         self.status.setText(text)
 
     def set_buttons_enabled(self, enabled):
-        for b in (self.btn_scan, self.btn_delete):
+        for b in (self.btn_scan, self.btn_delete, *self._target_btns):
             b.setEnabled(enabled)
 
     def set_busy(self, busy):
         self.set_buttons_enabled(not busy)
+        # 取消按钮与任务状态相反：仅 busy 时可用
+        self.btn_cancel.setEnabled(bool(busy))
 
     def remove_current(self):
         self.app._remove_selected(self.list.currentRow())
 
     def refresh_list(self, results=None):
+        # 记录当前选中路径，重建后重新选中
+        cur = self.list.currentItem()
+        cur_path = cur.data(Qt.ItemDataRole.UserRole + 1) if cur else None
         self.list.clear()
         for path in self.app.targets:
             typ = "\U0001F4C1 文件夹" if os.path.isdir(path) else "\U0001F4C4 文件"
@@ -971,11 +1125,17 @@ class MainWindow(QWidget):
                 }
                 if st in smap:
                     status, status_color = smap[st]
-            item = QListWidgetItem(f"{path}")
+            # 状态拼进显示文本：UserRole 没有任何 delegate/渲染读取，
+            # 只存数据角色的话删除结果（✓已删除/✗失败/待重启/已拦截）在列表里不可见
+            text = f"{path}  —  {status}" if status else f"{path}"
+            item = QListWidgetItem(text)
             item.setToolTip(path)
+            item.setData(Qt.ItemDataRole.UserRole + 1, path)
             if status:
                 item.setData(Qt.ItemDataRole.UserRole, (status, status_color))
             self.list.addItem(item)
+            if cur_path is not None and path.lower() == cur_path.lower():
+                self.list.setCurrentItem(item)
 
 
 # ===========================================================================

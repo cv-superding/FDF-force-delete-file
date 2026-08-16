@@ -242,6 +242,8 @@ GetFinalPathNameByHandleW = _proto(kernel32, "GetFinalPathNameByHandleW", wintyp
 QueryFullProcessImageNameW = _proto(kernel32, "QueryFullProcessImageNameW", wintypes.BOOL,
                                     [wintypes.HANDLE, wintypes.DWORD, wintypes.LPWSTR,
                                      ctypes.POINTER(wintypes.DWORD)])
+GetLongPathNameW = _proto(kernel32, "GetLongPathNameW", wintypes.DWORD,
+                          [wintypes.LPCWSTR, wintypes.LPWSTR, wintypes.DWORD])
 WriteFile = _proto(kernel32, "WriteFile", wintypes.BOOL,
                    [wintypes.HANDLE, LPVOID, wintypes.DWORD,
                     ctypes.POINTER(wintypes.DWORD), LPVOID])
@@ -316,6 +318,62 @@ def strip_prefix(path: str) -> str:
     return path
 
 
+def _is_drive_root(p: str) -> bool:
+    """X:\\ 形式的卷根（保留尾反斜杠，不做 rstrip）。"""
+    return len(p) == 3 and p[1] == ":" and p[2] == "\\"
+
+
+def expand_long_path(path: str) -> str:
+    """展开 8.3 短文件名（如 PROGRA~1）为完整长名；失败时原样返回。"""
+    if "~" not in path:
+        return path
+    n = GetLongPathNameW(path, None, 0)
+    if n <= 0:
+        return path
+    buf = ctypes.create_unicode_buffer(n)
+    if GetLongPathNameW(path, buf, n) > 0:
+        return buf.value
+    return path
+
+
+def norm_path(path: str) -> str:
+    """
+    权威路径规范化：剥掉 \\\\?\\ / \\\\?\\UNC\\ 前缀、展开 8.3 短名、
+    去掉尾随分隔符（卷根 X:\\ 除外）。护栏判断与实际删除共用此函数，
+    避免两种写法（前缀 / 短名 / 尾斜杠）造成语义分叉被绕过。
+    """
+    p = strip_prefix(str(path).replace("/", "\\"))
+    p = expand_long_path(p)
+    if _is_drive_root(p):
+        return p
+    return p.rstrip("\\")
+
+
+def real_path(path: str) -> str | None:
+    """
+    解析路径的最终物理路径（跟随符号链接 / junction）。
+    打不开（不存在/无权限）时返回 None，调用方回退到 norm_path 结果。
+    """
+    flags = FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT
+    h = CreateFileW(long_path(path), READ_CONTROL | FILE_READ_ATTRIBUTES,
+                    FILE_SHARE_ALL, None, OPEN_EXISTING, flags, None)
+    if h == INVALID_HANDLE_VALUE:
+        return None
+    try:
+        cap = 1024
+        for _ in range(2):
+            buf = ctypes.create_unicode_buffer(cap)
+            n = GetFinalPathNameByHandleW(h, buf, cap, FILE_NAME_NORMALIZED)
+            if n == 0:
+                return None
+            if n < cap:
+                return norm_path(buf.value)
+            cap = n + 1
+        return None
+    finally:
+        CloseHandle(h)
+
+
 def get_attributes(path: str) -> int:
     return GetFileAttributesW(long_path(path))
 
@@ -387,12 +445,17 @@ def posix_delete(path: str, is_dir: bool) -> tuple[bool, int]:
         if ok:
             return True, 0
         err = ctypes.get_last_error()
-        # 老系统不支持 Ex，退回经典 FileDispositionInfo
+        # 老系统不支持 Ex，退回经典 FileDispositionInfo。
+        # 经典语义是"最后一个句柄关闭时才删除"：返回 TRUE 时文件往往还在磁盘上，
+        # 必须复查存在性，否则上层会误判为已删除而跳过 L2-L5。
         legacy = wintypes.BOOL(True)
         if SetFileInformationByHandle(h, FileDispositionInfo,
                                       ctypes.byref(legacy), ctypes.sizeof(legacy)):
-            return True, 0
-        return False, err
+            if not path_exists(path):
+                return True, 0
+            # 登记了"关句柄时删除"但对象仍在 → 按失败处理，让上层继续升级
+            return False, err
+        return False, ctypes.get_last_error() or err
     finally:
         CloseHandle(h)
 
@@ -405,14 +468,53 @@ def plain_delete(path: str, is_dir: bool) -> tuple[bool, int]:
 
 
 def schedule_delete_on_reboot(path: str) -> bool:
-    """登记重启时删除（写入 PendingFileRenameOperations），需要管理员权限。"""
-    return bool(MoveFileExW(long_path(path), None, MOVEFILE_DELAY_UNTIL_REBOOT))
+    """登记重启时删除（写入 PendingFileRenameOperations），需要管理员权限。
+    登记前先查现有条目去重，避免多次运行重复登记、拖慢开机。"""
+    try:
+        existing = _pending_reboot_sources()
+    except Exception:  # noqa
+        existing = set()
+    lp = long_path(path)
+    src = "\\??\\" + (lp[4:] if lp.startswith("\\\\?\\") else lp)
+    if src.lower() in existing:
+        return True  # 之前已登记过，视为成功
+    return bool(MoveFileExW(lp, None, MOVEFILE_DELAY_UNTIL_REBOOT))
+
+
+HKEY_LOCAL_MACHINE = 0x80000002
+RRF_RT_REG_MULTI_SZ = 0x00020000
+RegGetValueW = _proto(advapi32, "RegGetValueW", wintypes.LONG,
+                      [wintypes.HANDLE, wintypes.LPCWSTR, wintypes.LPCWSTR,
+                       wintypes.DWORD, LPVOID, LPVOID, ctypes.POINTER(wintypes.DWORD)])
+
+
+def _pending_reboot_sources() -> set[str]:
+    """读取 PendingFileRenameOperations 中已登记的源路径（小写、含 \\??\\ 前缀）。"""
+    subkey = r"SYSTEM\CurrentControlSet\Control\Session Manager"
+    size = wintypes.DWORD(0)
+    rc = RegGetValueW(HKEY_LOCAL_MACHINE, subkey, "PendingFileRenameOperations",
+                      RRF_RT_REG_MULTI_SZ, None, None, ctypes.byref(size))
+    if rc not in (0, 234):  # 234 = ERROR_MORE_DATA，表示需要缓冲
+        return set()
+    buf = ctypes.create_unicode_buffer(max(1, size.value // 2))
+    rc = RegGetValueW(HKEY_LOCAL_MACHINE, subkey, "PendingFileRenameOperations",
+                      RRF_RT_REG_MULTI_SZ, None, buf, ctypes.byref(size))
+    if rc != 0:
+        return set()
+    # REG_MULTI_SZ：NUL 分隔、双 NUL 结尾；条目按 (源, 目标) 成对出现
+    items = [s for s in buf.raw.decode("utf-16-le", errors="ignore").split("\x00") if s]
+    return {items[i].lower() for i in range(0, len(items) - 1, 2)}
 
 
 def overwrite_file(path: str, passes: int = 1, chunk: int = 1 << 20) -> bool:
     """删除前用随机数据覆写文件内容，降低被恢复的可能。"""
+    # 符号链接只允许"删链接"，绝不允许覆写 —— 普通打开会跟随到目标文件，
+    # 把用户没选定的内容整段破坏掉。
+    attrs = get_attributes(path)
+    if attrs != INVALID_FILE_ATTRIBUTES and attrs & FILE_ATTRIBUTE_REPARSE_POINT:
+        return False
     h = CreateFileW(long_path(path), GENERIC_WRITE, FILE_SHARE_ALL, None,
-                    OPEN_EXISTING, FILE_FLAG_WRITE_THROUGH, None)
+                    OPEN_EXISTING, FILE_FLAG_WRITE_THROUGH | FILE_FLAG_OPEN_REPARSE_POINT, None)
     if h == INVALID_HANDLE_VALUE:
         return False
     try:
@@ -568,16 +670,18 @@ def is_admin() -> bool:
 
 
 # ---------------------------------------------------------------- 占用检测
-def get_pids_using_file(path: str) -> list[int]:
+def get_pids_using_file(path: str) -> tuple[list[int], int]:
     """
     NtQueryInformationFile(FileProcessIdsUsingFileInformation)：
     直接向内核索取"当前打开此文件的进程 PID 列表"，比枚举全系统句柄快几个数量级。
+    返回 (pid 列表, 错误码)：错误码非 0 表示"检测不可用"（独占打开/权限不足等），
+    与"确实无人占用"（空列表 + 错误码 0）区分，调用方据此决定是否降级。
     """
     h = CreateFileW(long_path(path), FILE_READ_ATTRIBUTES | SYNCHRONIZE, FILE_SHARE_ALL,
                     None, OPEN_EXISTING,
                     FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, None)
     if h == INVALID_HANDLE_VALUE:
-        return []
+        return [], ctypes.get_last_error()
     try:
         size = 4096
         for _ in range(6):
@@ -589,13 +693,13 @@ def get_pids_using_file(path: str) -> list[int]:
                 size *= 4
                 continue
             if status != STATUS_SUCCESS:
-                return []
+                return [], int(RtlNtStatusToDosError(status))
             n = ctypes.cast(buf, ctypes.POINTER(wintypes.ULONG)).contents.value
             ptr_size = ctypes.sizeof(ULONG_PTR)
             arr = ctypes.cast(ctypes.byref(buf, ptr_size),
                               ctypes.POINTER(ULONG_PTR * max(n, 1))).contents
-            return [int(arr[i]) for i in range(n)]
-        return []
+            return [int(arr[i]) for i in range(n)], 0
+        return [], 0
     finally:
         CloseHandle(h)
 
@@ -704,11 +808,23 @@ def _handle_target_path(dup: wintypes.HANDLE) -> str:
     """只对磁盘文件求路径 —— GetFileType 先过滤掉管道/套接字，避免 API 挂死。"""
     if GetFileType(dup) != FILE_TYPE_DISK:
         return ""
-    buf = ctypes.create_unicode_buffer(1024)
-    n = GetFinalPathNameByHandleW(dup, buf, 1024, FILE_NAME_NORMALIZED)
-    if n == 0 or n >= 1024:
-        return ""
-    return buf.value
+    cap = 1024
+    for _ in range(3):
+        buf = ctypes.create_unicode_buffer(cap)
+        n = GetFinalPathNameByHandleW(dup, buf, cap, FILE_NAME_NORMALIZED)
+        if n == 0:
+            return ""
+        if n < cap:  # 返回值不含结尾 NUL，n < cap 才写全
+            return buf.value
+        cap = n + 1  # 缓冲不足按需扩容重试，不再直接放弃超长路径
+    return ""
+
+
+# 强关句柄 / 结束进程都绝不能碰的系统关键进程
+CRITICAL_PROCESSES = frozenset((
+    "csrss.exe", "wininit.exe", "winlogon.exe", "services.exe", "lsass.exe",
+    "smss.exe", "svchost.exe", "system", "fontdrvhost.exe", "dwm.exe",
+))
 
 
 def force_close_handles(targets: list[str], progress=None) -> tuple[int, list[str]]:
@@ -719,7 +835,7 @@ def force_close_handles(targets: list[str], progress=None) -> tuple[int, list[st
     """
     wanted = set()
     for t in targets:
-        wanted.add(strip_prefix(long_path(t)).lower())
+        wanted.add(norm_path(t).lower())
     if not wanted:
         return 0, []
 
@@ -766,13 +882,19 @@ def force_close_handles(targets: list[str], progress=None) -> tuple[int, list[st
                 CloseHandle(dup)
             if not target:
                 continue
-            if strip_prefix(target).lower() not in wanted:
+            if norm_path(target).lower() not in wanted:
                 continue
 
+            # 系统关键进程持有的句柄一律不强关：强拆 csrss/lsass 等进程的句柄
+            # 可能直接引发进程崩溃甚至蓝屏。
+            img = get_process_image(pid)
+            base = os.path.basename(img).lower() if img else ""
+            if base in CRITICAL_PROCESSES:
+                affected.add(f"{base or '系统进程'} (PID {pid}) 已跳过（关键进程）")
+                continue
             if DuplicateHandle(ph, src, None, None, 0, False, DUPLICATE_CLOSE_SOURCE):
                 closed += 1
-                img = get_process_image(pid)
-                affected.add(f"{os.path.basename(img) or '未知进程'} (PID {pid})")
+                affected.add(f"{base or '未知进程'} (PID {pid})")
     finally:
         for ph in proc_cache.values():
             if ph:
